@@ -31,10 +31,12 @@ export async function checkRateLimit(
   ip: string,
 ): Promise<{ success: boolean; remaining: number; skipped?: boolean }> {
   if (!isUpstashConfigured()) {
-    console.warn(
-      "ratelimit_skipped: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set",
+    if (process.env.NODE_ENV === "development") {
+      return { success: true, remaining: 999, skipped: true };
+    }
+    throw new Error(
+      "UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be set in production",
     );
-    return { success: true, remaining: 999, skipped: true };
   }
 
   try {
@@ -44,11 +46,10 @@ export async function checkRateLimit(
       remaining: result.remaining,
     };
   } catch (err) {
-    console.error(
-      "ratelimit_error",
-      err instanceof Error ? err.message : err,
-    );
-    // Do not fail secret fetch when Redis is down — log and continue
-    return { success: true, remaining: 999, skipped: true };
+    if (process.env.NODE_ENV === "development") {
+      console.error("ratelimit_unavailable", err instanceof Error ? err.message : err);
+      return { success: true, remaining: 999, skipped: true };
+    }
+    throw err;
   }
 }

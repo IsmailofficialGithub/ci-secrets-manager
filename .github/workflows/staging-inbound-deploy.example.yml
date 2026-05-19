@@ -1,0 +1,166 @@
+# Copy to your inbound repo as .github/workflows/staging-inbound-deploy.yml
+#
+# GitHub Actions secrets (Settings → Secrets and variables → Actions) — ONLY these 3:
+#   SECRETS_API_URL  = https://ci-secrets-manager.vercel.app
+#   PROJECT_ID       = <uuid from Pipeline Secrets dashboard>
+#   DEPLOY_TOKEN     = pst_... (generate in Pipeline Secrets → Secrets page)
+#
+# Server credentials (INBOUND2_SERVER_*) are loaded from Pipeline Secrets at deploy time.
+# Optional (for CI frontend build — use same values as server .env.staging):
+#   REACT_APP_SUPABASE_URL, REACT_APP_SUPABASE_ANON_KEY, etc.
+
+name: Staging Inbound Deploy
+
+on:
+  push:
+    branches:
+      - staging-inbound
+
+concurrency:
+  group: staging-inbound-deploy
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Test backend & build frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Validate backend JavaScript syntax
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find . -name '*.js' -not -path './node_modules/*' -print0)
+
+      - name: Build frontend
+        env:
+          CI: true
+          GENERATE_SOURCEMAP: false
+          TSC_COMPILE_ON_ERROR: true
+          NODE_OPTIONS: --max-old-space-size=3072
+          REACT_APP_SUPABASE_URL: https://ci-placeholder.supabase.co
+          REACT_APP_SUPABASE_ANON_KEY: ci-placeholder-anon-key
+          REACT_APP_APP_NAME: DNAi
+          REACT_APP_APP_URL: https://staging.example.com
+        run: npm run build
+
+      - name: Upload build artifact (reference)
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-inbound-build
+          path: build/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to staging server
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Fetch server secrets from Pipeline Secrets
+        env:
+          SECRETS_API_URL: ${{ secrets.SECRETS_API_URL }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          response=$(curl -sS -f -X POST "${SECRETS_API_URL}/api/ci/secrets" \
+            -H "Content-Type: application/json" \
+            -d "{\"projectId\":\"${PROJECT_ID}\",\"token\":\"${DEPLOY_TOKEN}\"}")
+          echo "$response" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"' | while IFS= read -r line; do
+            key="${line%%=*}"
+            value="${line#*=}"
+            echo "::add-mask::${value}"
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DEPLOY_BRANCH: staging-inbound
+          APP_ROOT: staging-retail-inbound/inbound-call-agent-core
+          WEB_ROOT: /var/www/inbound2_staging_DNai
+          BACKUP_ROOT: /var/www/inbound2_staging_DNai_deploy_backups
+        with:
+          host: ${{ env.INBOUND2_SERVER_IP }}
+          username: ${{ env.INBOUND2_SERVER_USER }}
+          password: ${{ env.INBOUND2_SERVER_PASSWORD }}
+          port: ${{ env.INBOUND2_SERVER_PORT }}
+          envs: DEPLOY_BRANCH,APP_ROOT,WEB_ROOT,BACKUP_ROOT
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${HOME}/${APP_ROOT}"
+            if [ ! -d "$APP_DIR" ]; then
+              echo "ERROR: App directory not found: $APP_DIR"
+              exit 1
+            fi
+
+            cd "$APP_DIR"
+            PREVIOUS_SHA="$(git rev-parse HEAD)"
+            echo "Previous commit: $PREVIOUS_SHA"
+
+            git fetch origin "$DEPLOY_BRANCH"
+            git checkout "$DEPLOY_BRANCH"
+            git pull origin "$DEPLOY_BRANCH"
+            NEW_SHA="$(git rev-parse HEAD)"
+            echo "Deployed commit: $NEW_SHA"
+
+            echo "$PREVIOUS_SHA" > .deploy-previous-sha
+            echo "$NEW_SHA" > .deploy-current-sha
+
+            cd backend
+            npm ci --omit=dev || npm install
+            pm2 reload 4
+            cd ..
+
+            npm ci --omit=dev 2>/dev/null || npm install
+            npm run build
+
+            sudo mkdir -p "$BACKUP_ROOT"
+            BACKUP_NAME="backup-$(date +%Y%m%d-%H%M%S)-${NEW_SHA:0:7}"
+            sudo mkdir -p "$BACKUP_ROOT/$BACKUP_NAME"
+            if [ -d "$WEB_ROOT" ] && [ "$(ls -A "$WEB_ROOT" 2>/dev/null || true)" ]; then
+              echo "Backing up current static files to $BACKUP_ROOT/$BACKUP_NAME"
+              sudo cp -a "$WEB_ROOT/." "$BACKUP_ROOT/$BACKUP_NAME/"
+            fi
+
+            sudo mkdir -p "$WEB_ROOT"
+            sudo cp -r build/* "$WEB_ROOT/"
+
+            if sudo nginx -t; then
+              sudo systemctl reload nginx || sudo nginx -s reload
+            else
+              echo "ERROR: nginx config test failed — static files were updated but nginx was not reloaded."
+              exit 1
+            fi
+
+            echo "Deploy finished successfully."
+            echo "  App:     $APP_DIR"
+            echo "  Commit:  $NEW_SHA"
+            echo "  Backup:  $BACKUP_ROOT/$BACKUP_NAME"
+            echo "  Rollback: run workflow 'Staging Inbound Rollback' or: git -C $APP_DIR reset --hard $PREVIOUS_SHA"
