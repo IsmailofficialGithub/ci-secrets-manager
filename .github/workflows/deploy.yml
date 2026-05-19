@@ -1,0 +1,44 @@
+name: Deploy with remote secrets
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch secrets from Pipeline Secrets API
+        env:
+          SECRETS_API_URL: ${{ secrets.SECRETS_API_URL }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          response=$(curl -sS -f -X POST "${SECRETS_API_URL}/api/ci/secrets" \
+            -H "Content-Type: application/json" \
+            -d "{\"projectId\":\"${PROJECT_ID}\",\"token\":\"${DEPLOY_TOKEN}\"}")
+
+          echo "$response" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"' | while IFS= read -r line; do
+            key="${line%%=*}"
+            value="${line#*=}"
+            echo "::add-mask::${value}"
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Example — use SERVER_IP from Pipeline Secrets
+        env:
+          SERVER_IP: ${{ env.SERVER_IP }}
+        run: |
+          # Add secret key SERVER_IP in the dashboard; it becomes env.SERVER_IP here
+          echo "Server IP is available (masked in logs). Use in ssh/curl/rsync:"
+          # ssh deploy@$SERVER_IP './deploy.sh'
+
+      - name: Deploy application
+        run: |
+          echo "Deploying with configured secrets (values are masked in logs)…"
+          # npm run deploy
