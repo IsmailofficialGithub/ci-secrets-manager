@@ -75,6 +75,8 @@ Open [http://localhost:3000](http://localhost:3000), sign up, create a project, 
 
 ## GitHub Actions
 
+Full guide: **[docs/USE_IN_OTHER_PROJECTS.md](docs/USE_IN_OTHER_PROJECTS.md)**
+
 ### Use secrets in another repository (e.g. `SERVER_IP`)
 
 **1. In Pipeline Secrets (dashboard)**

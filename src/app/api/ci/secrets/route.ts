@@ -10,13 +10,29 @@ import { ciSecretsRequestSchema } from "@/lib/validations";
 
 export const runtime = "nodejs";
 
+function errorResponse(message: string, status: number) {
+  const body: { error: string; detail?: string } = { error: message };
+  if (process.env.NODE_ENV === "development") {
+    body.detail = message;
+  }
+  return NextResponse.json(body, { status });
+}
+
 export async function POST(request: Request) {
   const ip = getClientIp(request);
   const userAgent = getUserAgent(request);
-  const admin = createAdminSupabaseClient();
 
   let projectId: string | null = null;
   let tokenId: string | null = null;
+  let admin: ReturnType<typeof createAdminSupabaseClient> | null = null;
+
+  try {
+    admin = createAdminSupabaseClient();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Admin client failed";
+    console.error("ci_secrets_config_error", msg);
+    return errorResponse("Server configuration error", 503);
+  }
 
   try {
     const rate = await checkRateLimit(ip);
@@ -57,7 +73,19 @@ export async function POST(request: Request) {
 
     const tokens = (tokenRows ?? []) as DeployTokenRow[];
 
-    if (tokenError || !tokens.length) {
+    if (tokenError) {
+      console.error("ci_secrets_token_query", tokenError.message);
+      await logAudit(admin, {
+        projectId,
+        tokenId: null,
+        ip,
+        userAgent,
+        action: "fetch_failure",
+      });
+      return errorResponse("Failed to validate token", 500);
+    }
+
+    if (!tokens.length) {
       await logAudit(admin, {
         projectId,
         tokenId: null,
@@ -94,6 +122,7 @@ export async function POST(request: Request) {
       .eq("project_id", projectId);
 
     if (secretsError) {
+      console.error("ci_secrets_fetch", secretsError.message);
       await logAudit(admin, {
         projectId,
         tokenId,
@@ -101,16 +130,35 @@ export async function POST(request: Request) {
         userAgent,
         action: "fetch_failure",
       });
-      return NextResponse.json({ error: "Failed to fetch secrets" }, { status: 500 });
+      return errorResponse("Failed to fetch secrets", 500);
     }
 
     const env: Record<string, string> = {};
     for (const secret of (secrets ?? []) as SecretRow[]) {
-      env[secret.key] = decrypt(
-        secret.encrypted_value,
-        secret.iv,
-        secret.auth_tag,
-      );
+      try {
+        env[secret.key] = decrypt(
+          secret.encrypted_value,
+          secret.iv,
+          secret.auth_tag,
+        );
+      } catch (decryptErr) {
+        const msg =
+          decryptErr instanceof Error ? decryptErr.message : "Decrypt failed";
+        console.error("ci_secrets_decrypt", secret.key, msg);
+        await logAudit(admin, {
+          projectId,
+          tokenId,
+          ip,
+          userAgent,
+          action: "fetch_failure",
+        });
+        return errorResponse(
+          process.env.NODE_ENV === "development"
+            ? `Decryption failed for "${secret.key}". Check MASTER_ENCRYPTION_KEY matches the key used when the secret was saved.`
+            : "Failed to decrypt secrets",
+          500,
+        );
+      }
     }
 
     await logAudit(admin, {
@@ -122,14 +170,23 @@ export async function POST(request: Request) {
     });
 
     return NextResponse.json({ env });
-  } catch {
-    await logAudit(admin, {
-      projectId,
-      tokenId,
-      ip,
-      userAgent,
-      action: "fetch_failure",
-    });
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    console.error("ci_secrets_error", msg);
+
+    if (admin) {
+      await logAudit(admin, {
+        projectId,
+        tokenId,
+        ip,
+        userAgent,
+        action: "fetch_failure",
+      }).catch(() => undefined);
+    }
+
+    return errorResponse(
+      process.env.NODE_ENV === "development" ? msg : "Internal server error",
+      500,
+    );
   }
 }
