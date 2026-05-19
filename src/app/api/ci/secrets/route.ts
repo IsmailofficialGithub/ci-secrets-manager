@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getCiConfigStatus } from "@/lib/ci-config";
 import { logAudit } from "@/lib/audit";
 import { decrypt } from "@/lib/encryption";
 import { checkRateLimit } from "@/lib/ratelimit";
@@ -10,28 +11,54 @@ import { ciSecretsRequestSchema } from "@/lib/validations";
 
 export const runtime = "nodejs";
 
-function errorResponse(message: string, status: number) {
-  const body: { error: string; detail?: string } = { error: message };
-  if (process.env.NODE_ENV === "development") {
-    body.detail = message;
-  }
-  return NextResponse.json(body, { status });
+function apiError(
+  error: string,
+  status: number,
+  code: string,
+  detail?: string,
+) {
+  return NextResponse.json(
+    {
+      error,
+      code,
+      ...(detail ? { detail } : {}),
+    },
+    { status },
+  );
 }
 
 export async function POST(request: Request) {
   const ip = getClientIp(request);
   const userAgent = getUserAgent(request);
 
+  const config = getCiConfigStatus();
+  if (!config.serviceRoleKey || !config.supabaseUrl) {
+    return apiError(
+      "Server configuration error",
+      503,
+      "SUPABASE_NOT_CONFIGURED",
+      "Set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on Vercel",
+    );
+  }
+  if (!config.masterEncryptionKey) {
+    return apiError(
+      "Server configuration error",
+      503,
+      "MASTER_KEY_NOT_CONFIGURED",
+      "Set MASTER_ENCRYPTION_KEY on Vercel (same value used when secrets were saved)",
+    );
+  }
+
   let projectId: string | null = null;
   let tokenId: string | null = null;
-  let admin: ReturnType<typeof createAdminSupabaseClient> | null = null;
+  let admin: ReturnType<typeof createAdminSupabaseClient>;
 
   try {
     admin = createAdminSupabaseClient();
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Admin client failed";
     console.error("ci_secrets_config_error", msg);
-    return errorResponse("Server configuration error", 503);
+    return apiError("Server configuration error", 503, "SUPABASE_CLIENT_FAILED", msg);
   }
 
   try {
@@ -44,7 +71,7 @@ export async function POST(request: Request) {
         userAgent,
         action: "rate_limited",
       });
-      return NextResponse.json({ error: "Too many requests" }, { status: 429 });
+      return apiError("Too many requests", 429, "RATE_LIMITED");
     }
 
     const body = await request.json().catch(() => null);
@@ -58,11 +85,11 @@ export async function POST(request: Request) {
         userAgent,
         action: "validation_error",
       });
-      return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+      return apiError("Invalid request", 400, "VALIDATION_ERROR");
     }
 
     projectId = parsed.data.projectId;
-    const incomingToken = parsed.data.token;
+    const incomingToken = parsed.data.token.trim();
     const incomingHash = hashToken(incomingToken);
 
     const { data: tokenRows, error: tokenError } = await admin
@@ -82,7 +109,12 @@ export async function POST(request: Request) {
         userAgent,
         action: "fetch_failure",
       });
-      return errorResponse("Failed to validate token", 500);
+      return apiError(
+        "Failed to validate token",
+        500,
+        "TOKEN_QUERY_FAILED",
+        tokenError.message,
+      );
     }
 
     if (!tokens.length) {
@@ -93,7 +125,12 @@ export async function POST(request: Request) {
         userAgent,
         action: "invalid_token",
       });
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return apiError(
+        "Unauthorized",
+        401,
+        "INVALID_TOKEN",
+        "No matching deploy token. Generate a new API key in the dashboard and copy it exactly (starts with pst_).",
+      );
     }
 
     const now = new Date();
@@ -111,7 +148,12 @@ export async function POST(request: Request) {
         userAgent,
         action: "invalid_token",
       });
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return apiError(
+        "Unauthorized",
+        401,
+        "INVALID_TOKEN",
+        "Token revoked, expired, or incorrect.",
+      );
     }
 
     tokenId = validToken.id;
@@ -130,7 +172,12 @@ export async function POST(request: Request) {
         userAgent,
         action: "fetch_failure",
       });
-      return errorResponse("Failed to fetch secrets", 500);
+      return apiError(
+        "Failed to fetch secrets",
+        500,
+        "SECRETS_QUERY_FAILED",
+        secretsError.message,
+      );
     }
 
     const env: Record<string, string> = {};
@@ -152,11 +199,11 @@ export async function POST(request: Request) {
           userAgent,
           action: "fetch_failure",
         });
-        return errorResponse(
-          process.env.NODE_ENV === "development"
-            ? `Decryption failed for "${secret.key}". Check MASTER_ENCRYPTION_KEY matches the key used when the secret was saved.`
-            : "Failed to decrypt secrets",
+        return apiError(
+          "Failed to decrypt secrets",
           500,
+          "DECRYPT_FAILED",
+          `Secret "${secret.key}": MASTER_ENCRYPTION_KEY on Vercel must match the key used when saving secrets locally.`,
         );
       }
     }
@@ -174,19 +221,14 @@ export async function POST(request: Request) {
     const msg = err instanceof Error ? err.message : "Unknown error";
     console.error("ci_secrets_error", msg);
 
-    if (admin) {
-      await logAudit(admin, {
-        projectId,
-        tokenId,
-        ip,
-        userAgent,
-        action: "fetch_failure",
-      }).catch(() => undefined);
-    }
+    await logAudit(admin, {
+      projectId,
+      tokenId,
+      ip,
+      userAgent,
+      action: "fetch_failure",
+    }).catch(() => undefined);
 
-    return errorResponse(
-      process.env.NODE_ENV === "development" ? msg : "Internal server error",
-      500,
-    );
+    return apiError("Internal server error", 500, "INTERNAL_ERROR", msg);
   }
 }

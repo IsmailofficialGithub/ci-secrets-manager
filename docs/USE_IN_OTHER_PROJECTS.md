@@ -129,9 +129,27 @@ jobs:
 
 ## Troubleshooting
 
+Check production config (no secrets exposed):
+
+```bash
+curl -sS https://YOUR_APP.vercel.app/api/ci/health
+```
+
+All checks should be `true`. On Vercel → **Settings → Environment Variables**, set the same values as local `.env.local`:
+
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `MASTER_ENCRYPTION_KEY` — **must match** the key used when you saved secrets locally
+- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (optional but recommended)
+
+After changing env vars, **Redeploy** on Vercel.
+
 | Problem | Fix |
 |---------|-----|
-| `401 Unauthorized` | Wrong `DEPLOY_TOKEN`, revoked token, or expired token |
+| `500` + `DECRYPT_FAILED` | `MASTER_ENCRYPTION_KEY` on Vercel ≠ local key; re-save secrets or fix key |
+| `500` + `SUPABASE_NOT_CONFIGURED` | Add service role + Supabase URL on Vercel, redeploy |
+| `401` + `INVALID_TOKEN` | Regenerate API key; copy full `pst_...` token (one `_` after `pst`) |
 | `curl: Failed to connect` | `SECRETS_API_URL` wrong or app not deployed publicly |
 | `env.SERVER_IP` empty | Fetch step failed, or key name mismatch in dashboard |
 | `invalid_credentials` on dashboard | Confirm email before login (Supabase) |
